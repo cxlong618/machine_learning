@@ -1,0 +1,26 @@
+# 代码示例核心依赖
+# 安装命令: pip install -r requirements.txt
+
+# 核心数据科学库（必需）
+numpy>=1.21.0
+pandas>=1.3.0
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# 机器学习库（必需）
+scikit-learn>=1.0.0
+
+# 科学计算（必需）
+scipy>=1.7.0
+
+# Jupyter支持（推荐）
+jupyter>=1.0.0
+ipykernel>=6.0.0
+
+# 可选：进度条显示
+tqdm>=4.62.0
+
+# 安装说明：
+# 1. 基础安装：pip install numpy pandas matplotlib scikit-learn scipy
+# 2. 完整安装：pip install -r requirements.txt
+# 3. 使用Jupyter：pip install jupyter ipykernel
