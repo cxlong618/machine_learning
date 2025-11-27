@@ -1,0 +1,61 @@
+# 产品分类项目依赖 - 兼容性版本
+# Python 3.12+ + PyTorch 2.3.0 + CUDA 12.1
+
+# 深度学习框架 (固定版本避免兼容性问题)
+torch==2.3.0
+torchvision==0.18.0
+torchaudio==2.3.0
+
+
+# Transformers和NLP库
+transformers
+tokenizers
+datasets
+jieba
+
+# ModelScope模型库
+modelscope
+
+# 数据处理
+pandas
+openpyxl
+numpy
+scikit-learn
+scipy
+
+# 可视化和日志
+matplotlib
+seaborn
+tensorboard
+wandb
+tqdm
+
+# Web服务框架 (用于本地测试)
+fastapi
+uvicorn
+python-multipart
+pydantic
+
+# 模型优化和部署
+onnx
+accelerate
+
+# 配置管理
+pyyaml
+python-dotenv
+
+# 开发工具
+pytest
+black
+flake8
+
+# 实用工具
+pathlib2
+colorama
+
+# 性能优化
+psutil
+GPUtil
+
+# 日期时间处理
+python-dateutil

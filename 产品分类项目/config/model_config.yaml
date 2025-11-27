@@ -1,0 +1,131 @@
+# 产品分类模型配置文件
+# 所有训练参数配置
+
+# 模型基础配置
+model:
+  name: "dienstag/chinese-bert-wwm-ext"
+  source: "modelscope"  # 使用ModelScope作为模型源
+  max_length: 128
+  hidden_dropout_prob: 0.1
+  attention_probs_dropout_prob: 0.1
+
+# 分类任务配置
+tasks:
+  standard_name:
+    num_classes: 936
+    weight: 0.4  # 损失权重
+
+  level1:
+    num_classes: 24
+    weight: 0.2
+
+  level2:
+    num_classes: 78
+    weight: 0.2
+
+  level3:
+    num_classes: 138
+    weight: 0.2
+
+# 训练配置
+training:
+  # 数据配置
+  data:
+    train_path: "data/train.csv"
+    val_path: "data/val.csv"
+    test_path: null  # 可选
+    batch_size: 32
+    max_length: 128
+    num_workers: 4
+    shuffle: true
+    drop_last: true
+
+  # 训练参数
+  epochs: 10
+  learning_rate: 2e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  gradient_accumulation_steps: 1
+  fp16: true  # 混合精度训练
+  gradient_clip_norm: 1.0
+
+  # 早停配置
+  early_stopping:
+    patience: 3
+    monitor: "eval_loss"
+    mode: "min"
+    restore_best_weights: true
+
+  # 优化器配置
+  optimizer:
+    type: "AdamW"
+    betas: [0.9, 0.999]
+    eps: 1e-8
+
+# 学习率调度器配置
+scheduler:
+  type: "linear"
+  warmup_steps: null  # 将从warmup_ratio计算
+
+# 评估配置
+evaluation:
+  strategy: "epoch"
+  steps: 500
+  save_strategy: "epoch"
+  save_total_limit: 3
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  per_device_eval_batch_size: 64
+
+# 日志配置
+logging:
+  steps: 100
+  level: "INFO"
+  report_to: ["tensorboard", "wandb"]
+  project_name: "product-classifier"
+  experiment_name: "multi-task-bert-classification"
+
+# 输出配置
+output:
+  output_dir: "./models"
+  logging_dir: "./logs"
+  overwrite_output: false
+  save_on_each_epoch: true
+
+# 其他配置
+random_seed: 42
+dataloader_pin_memory: true
+dataloader_persistent_workers: true
+
+# 数据增强配置
+data_augmentation:
+  enabled: true
+  # 同义词替换
+  synonym_replacement:
+    probability: 0.1
+  # 随机删除
+  random_deletion:
+    probability: 0.05
+  # 词序打乱
+  word_shuffle:
+    probability: 0.05
+
+# 类别不平衡处理
+class_imbalance:
+  # 是否使用类别权重
+  use_class_weights: true
+  # 是否使用focal loss
+  use_focal_loss: false
+  focal_loss:
+    alpha: 0.25
+    gamma: 2.0
+
+# 模型保存配置
+checkpointing:
+  save_strategy: "epoch"
+  save_steps: null  # 每个epoch保存
+  save_total_limit: 3
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
