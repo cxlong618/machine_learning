@@ -9,6 +9,7 @@ import argparse
 import subprocess
 import logging
 from pathlib import Path
+os.environ['TORCH_CUDA_ARCH_LIST'] = '8.9'
 
 # 添加src目录到Python路径
 sys.path.append(str(Path(__file__).parent / "src"))

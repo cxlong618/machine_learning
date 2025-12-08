@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class ProductInference:
     """产品分类推理器"""
 
-    def __init__(self, model_path: str = "./models/best_model.pt"):
+    def __init__(self, model_path: str = "./models/best_model"):
         """
         初始化推理器
 
@@ -30,7 +30,8 @@ class ProductInference:
             model_path: 模型文件路径
         """
         self.model_path = model_path
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
 
         # 初始化模型和分词器
         self.model = None
@@ -46,56 +47,73 @@ class ProductInference:
     def _load_model(self):
         """加载训练好的模型"""
         try:
-            # 加载检查点
-            checkpoint = torch.load(self.model_path, map_location=self.device)
+            # 检查是否是目录格式（新保存格式）
+            if os.path.isdir(self.model_path):
+                logger.info(f"检测到目录格式模型: {self.model_path}")
 
-            # 获取模型配置
-            if 'config' in checkpoint:
-                # 如果配置已保存
-                from model import ProductClassifierConfig
-                config = ProductClassifierConfig()
-                config.__dict__.update(checkpoint['config'])
+                # 使用新的from_saved_model方法加载
+                self.model = MultiTaskProductClassifier.from_saved_model(
+                    self.model_path)
+
             else:
-                # 使用默认配置
-                from model import ProductClassifierConfig
-                config = ProductClassifierConfig()
+                # 兼容旧的单文件格式
+                logger.info(f"检测到单文件格式模型: {self.model_path}")
 
-            # 创建模型（直接实例化，避免from_pretrained）
-            from model import MultiTaskProductClassifier, BertConfig
+                # 加载检查点
+                checkpoint = torch.load(
+                    self.model_path, map_location=self.device)
 
-            # 创建配置
-            bert_config = BertConfig(
-                hidden_size=768,
-                num_hidden_layers=12,
-                num_attention_heads=12,
-                intermediate_size=3072,
-                hidden_dropout_prob=config.hidden_dropout_prob,
-                attention_probs_dropout_prob=config.hidden_dropout_prob,
-                max_position_embeddings=config.max_length + 2,  # +2 for [CLS] and [SEP]
-                vocab_size=21128,  # 中文BERT词汇表大小
-            )
+                # 获取模型配置
+                if 'config' in checkpoint:
+                    # 如果配置已保存
+                    from model import ProductClassifierConfig
+                    config = ProductClassifierConfig()
+                    config.__dict__.update(checkpoint['config'])
+                else:
+                    # 使用默认配置
+                    from model import ProductClassifierConfig
+                    config = ProductClassifierConfig()
 
-            # 添加自定义配置
-            bert_config.num_labels_standard = config.num_labels_standard
-            bert_config.num_labels_level1 = config.num_labels_level1
-            bert_config.num_labels_level2 = config.num_labels_level2
-            bert_config.num_labels_level3 = config.num_labels_level3
-            bert_config.loss_weights = config.loss_weights
+                # 创建模型（直接实例化，避免from_pretrained）
+                from transformers import BertConfig
 
-            # 创建模型实例
-            self.model = MultiTaskProductClassifier(bert_config)
+                # 创建配置
+                bert_config = BertConfig(
+                    hidden_size=768,
+                    num_hidden_layers=12,
+                    num_attention_heads=12,
+                    intermediate_size=3072,
+                    hidden_dropout_prob=config.hidden_dropout_prob,
+                    attention_probs_dropout_prob=config.hidden_dropout_prob,
+                    max_position_embeddings=config.max_length +
+                    2,  # +2 for [CLS] and [SEP]
+                    vocab_size=21128,  # 中文BERT词汇表大小
+                )
 
-            # 加载权重
-            if torch.cuda.device_count() > 1:
-                # 处理多GPU保存的模型
-                state_dict = {}
-                for k, v in checkpoint['model_state_dict'].items():
-                    name = k.replace('module.', '') if k.startswith('module.') else k
-                    state_dict[name] = v
-            else:
-                state_dict = checkpoint['model_state_dict']
+                # 添加自定义配置
+                bert_config.num_labels_standard = config.num_labels_standard
+                bert_config.num_labels_level1 = config.num_labels_level1
+                bert_config.num_labels_level2 = config.num_labels_level2
+                bert_config.num_labels_level3 = config.num_labels_level3
+                bert_config.loss_weights = config.loss_weights
 
-            self.model.load_state_dict(state_dict)
+                # 创建模型实例
+                self.model = MultiTaskProductClassifier(bert_config)
+
+                # 加载权重
+                if torch.cuda.device_count() > 1:
+                    # 处理多GPU保存的模型
+                    state_dict = {}
+                    for k, v in checkpoint['model_state_dict'].items():
+                        name = k.replace('module.', '') if k.startswith(
+                            'module.') else k
+                        state_dict[name] = v
+                else:
+                    state_dict = checkpoint['model_state_dict']
+
+                self.model.load_state_dict(state_dict)
+
+            # 确保模型在正确的设备上
             self.model.to(self.device)
             self.model.eval()
 
@@ -113,7 +131,8 @@ class ProductInference:
                 self.tokenizer = BertTokenizer.from_pretrained(tokenizer_path)
             else:
                 # 如果本地没有，使用预训练模型
-                self.tokenizer = load_tokenizer("dienstag/chinese-bert-wwm-ext")
+                self.tokenizer = load_tokenizer(
+                    "dienstag/chinese-bert-wwm-ext")
                 logger.warning("未找到本地分词器，使用预训练模型")
 
         except Exception as e:
@@ -130,6 +149,23 @@ class ProductInference:
             with open(mapping_path, 'r', encoding='utf-8') as f:
                 self.label_mappings = json.load(f)
 
+            # 创建反向映射以提高查找效率
+            self.reverse_mappings = {}
+            task_mappings = {
+                'standard': 'standard_name',
+                'level1': 'level1_category',
+                'level2': 'level2_category',
+                'level3': 'level3_category'
+            }
+
+            for label_type, mapping_key in task_mappings.items():
+                if mapping_key in self.label_mappings:
+                    reverse_key = f"{label_type}_reverse_mapping"
+                    self.reverse_mappings[reverse_key] = {str(idx): name for name, idx in self.label_mappings[mapping_key].items()}
+                    logger.info(f"创建反向映射: {reverse_key}, 包含 {len(self.reverse_mappings[reverse_key])} 个标签")
+                else:
+                    logger.warning(f"未找到映射键: {mapping_key}")
+
             logger.info("标签映射加载成功")
 
         except Exception as e:
@@ -143,7 +179,8 @@ class ProductInference:
             # 使用jieba分词
             words = jieba.lcut(str(text))
             # 过滤掉单字符（除非是数字或字母）
-            words = [word for word in words if len(word) > 1 or word.isdigit() or word.isalpha()]
+            words = [word for word in words if len(
+                word) > 1 or word.isdigit() or word.isalpha()]
             return ' '.join(words)
         except ImportError:
             logger.warning("jieba未安装，使用原始文本")
@@ -240,12 +277,24 @@ class ProductInference:
     def _decode_label(self, label_idx: int, label_type: str) -> str:
         """解码标签"""
         try:
-            mapping_key = f"{label_type}_reverse_mapping"
-            if mapping_key in self.label_mappings:
-                return self.label_mappings[mapping_key].get(str(int(label_idx)), f"未知标签_{label_idx}")
+            # 确保label_idx是整数
+            label_idx_int = int(label_idx)
+
+            # 使用预创建的反向映射进行快速查找
+            reverse_key = f"{label_type}_reverse_mapping"
+            if reverse_key in self.reverse_mappings:
+                result = self.reverse_mappings[reverse_key].get(str(label_idx_int))
+                if result:
+                    return result
+                else:
+                    logger.warning(f"未找到标签索引: {label_idx_int}, 类型: {label_type}")
+                    return f"未知标签_{label_idx_int}"
             else:
+                logger.warning(f"未找到反向映射类型: {label_type}")
                 return f"未知标签类型: {label_type}"
-        except Exception:
+
+        except Exception as e:
+            logger.error(f"标签解码错误: {e}, label_idx={label_idx}, label_type={label_type}")
             return f"解码错误_{label_idx}"
 
     def predict_batch(self, product_names: List[str], return_prob: bool = False) -> List[Dict]:
@@ -383,7 +432,7 @@ class ProductInference:
 _inference_instance = None
 
 
-def get_inference_instance(model_path: str = "./models/best_model.pt") -> ProductInference:
+def get_inference_instance(model_path: str = "./models/best_model") -> ProductInference:
     """获取推理器实例（单例模式）"""
     global _inference_instance
     if _inference_instance is None:
@@ -401,29 +450,35 @@ if __name__ == "__main__":
 
         # 测试单个预测
         test_products = [
-            "苹果iPhone 14 Pro手机",
-            "华为MateBook X Pro笔记本电脑",
-            "小米65寸智能电视",
-            "联想ThinkPad商务电脑",
-            "三星Galaxy Tab平板电脑"
+            "手术无影灯",
+            "彩色超声",
+            "4K腹腔镜",
+            "CT",
+            "胃镜"
         ]
 
         print("\n🔍 单个预测测试:")
         for product in test_products:
             print(f"\n产品: {product}")
             result = inference.predict(product, return_prob=True)
-            print(f"  标准名称: {result['standard_name']} (置信度: {result.get('confidence_standard', 'N/A'):.3f})")
-            print(f"  一级分类: {result['level1_category']} (置信度: {result.get('confidence_level1', 'N/A'):.3f})")
-            print(f"  二级分类: {result['level2_category']} (置信度: {result.get('confidence_level2', 'N/A'):.3f})")
-            print(f"  三级分类: {result['level3_category']} (置信度: {result.get('confidence_level3', 'N/A'):.3f})")
+            print(
+                f"  标准名称: {result['standard_name']} (置信度: {result.get('confidence_standard', 'N/A'):.3f})")
+            print(
+                f"  一级分类: {result['level1_category']} (置信度: {result.get('confidence_level1', 'N/A'):.3f})")
+            print(
+                f"  二级分类: {result['level2_category']} (置信度: {result.get('confidence_level2', 'N/A'):.3f})")
+            print(
+                f"  三级分类: {result['level3_category']} (置信度: {result.get('confidence_level3', 'N/A'):.3f})")
             print(f"  综合置信度: {result.get('overall_confidence', 'N/A'):.3f}")
             print(f"  响应时间: {result['response_time']}")
 
         # 测试批量预测
         print("\n📊 批量预测测试:")
-        batch_results = inference.predict_batch(test_products[:3], return_prob=True)
+        batch_results = inference.predict_batch(
+            test_products[:3], return_prob=True)
         for i, result in enumerate(batch_results):
-            print(f"  产品{i+1}: {result['standard_name']} - {result.get('overall_confidence', 'N/A'):.3f}")
+            print(
+                f"  产品{i+1}: {result['standard_name']} - {result.get('overall_confidence', 'N/A'):.3f}")
 
         # 测试Top-K预测
         print("\n🎯 Top-K预测测试:")
@@ -444,6 +499,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ 测试失败: {e}")
         print("请确保:")
-        print("  1. 模型文件已生成 (./models/best_model.pt)")
+        print("  1. 模型文件已生成 (./models/best_model/)")
         print("  2. 标签映射文件已生成 (./models/label_mappings.json)")
         print("  3. 分词器文件已保存 (./models/tokenizer/)")

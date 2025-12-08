@@ -6,6 +6,7 @@
 import os
 import sys
 import logging
+os.environ['TORCH_CUDA_ARCH_LIST'] = '8.9'
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -98,12 +99,46 @@ def run_training():
 
         logger.info("所有模块导入成功")
 
-        # 检查CUDA
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"使用设备: {device}")
+        # 强制使用GPU并优化配置
         if torch.cuda.is_available():
-            logger.info(f"GPU: {torch.cuda.get_device_name()}")
-            logger.info(f"显存: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+            device = torch.device('cuda')
+            gpu_props = torch.cuda.get_device_properties(0)
+            total_memory_gb = gpu_props.total_memory / 1e9
+            gpu_name = torch.cuda.get_device_name(0)
+
+            logger.info(f"使用设备: {device}")
+            logger.info(f"GPU: {gpu_name}")
+            logger.info(f"显存: {total_memory_gb:.1f} GB")
+
+            # 根据显存大小自动优化批次大小
+            if total_memory_gb >= 24:
+                # 24GB+ 显存，使用大批次
+                optimal_batch_size = min(args.batch_size, 64)
+                logger.info(f"大显存GPU，设置批次大小: {optimal_batch_size}")
+            elif total_memory_gb >= 16:
+                # 16-24GB 显存
+                optimal_batch_size = min(args.batch_size, 32)
+                logger.info(f"中等显存GPU，设置批次大小: {optimal_batch_size}")
+            elif total_memory_gb >= 8:
+                # 8-16GB 显存
+                optimal_batch_size = min(args.batch_size, 16)
+                logger.info(f"小显存GPU，设置批次大小: {optimal_batch_size}")
+            else:
+                # 小于8GB显存
+                optimal_batch_size = min(args.batch_size, 8)
+                logger.warning(f"很小显存GPU({total_memory_gb:.1f}GB)，设置小批次: {optimal_batch_size}")
+
+            args.batch_size = optimal_batch_size
+
+            # 清理GPU缓存
+            torch.cuda.empty_cache()
+            logger.info("GPU缓存已清理")
+
+        else:
+            logger.error("未检测到CUDA，请确保安装了GPU版本的PyTorch")
+            device = torch.device('cpu')
+            # GPU不可用时也使用相对合理的批次
+            args.batch_size = min(16, args.batch_size)
 
         # 设置环境变量
         os.environ['CUDA_VISIBLE_DEVICES'] = '0'
@@ -144,23 +179,30 @@ def run_training():
         # 创建数据整理器
         data_collator = DataCollator(tokenizer, max_length=args.max_length)
 
-        # 创建数据加载器
+        # 创建数据加载器 - GPU优化
+        pin_memory = torch.cuda.is_available()
+        num_workers = 0  # Windows下保持0避免问题
+
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=0,  # Windows兼容
-            pin_memory=True if torch.cuda.is_available() else False,
-            collate_fn=data_collator
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=True,  # 丢弃最后不完整的批次，提高GPU利用率
+            collate_fn=data_collator,
+            persistent_workers=False  # 避免内存泄漏
         )
 
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=0,
-            pin_memory=True if torch.cuda.is_available() else False,
-            collate_fn=data_collator
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=False,
+            collate_fn=data_collator,
+            persistent_workers=False
         )
 
         # 创建模型
@@ -197,70 +239,156 @@ def run_training():
 
         logger.info(f"总训练步数: {total_steps}")
 
-        # 训练循环
+        # 训练循环 - GPU优化
         logger.info("开始训练...")
         best_val_loss = float('inf')
         patience_counter = 0
-        max_patience = 3
+        max_patience = 5  # 增加耐心，充分利用GPU
+
+        # 使用混合精度训练加速（如果可用）
+        use_amp = torch.cuda.is_available() and hasattr(torch.cuda, 'amp')
+        if use_amp:
+            logger.info("启用混合精度训练加速")
+            scaler = torch.cuda.amp.GradScaler()
+
+        # 启用梯度检查点以节省显存
+        use_checkpoint = args.max_length > 128  # 长序列使用检查点
 
         for epoch in range(args.num_epochs):
             logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
 
+            # 预热GPU（前几个批次使用较小批次）
+            is_warmup = epoch == 0
+            warmup_factor = 0.5 if is_warmup else 1.0
+
             # 训练阶段
             model.train()
             total_train_loss = 0
-            train_progress = tqdm(train_dataloader, desc=f"训练 Epoch {epoch + 1}")
+            steps_per_epoch = len(train_dataloader)
+
+            # 使用更激进的进度条更新
+            train_progress = tqdm(
+                train_dataloader,
+                desc=f"训练 Epoch {epoch + 1}",
+                leave=True,
+                dynamic_ncols=True
+            )
 
             for step, batch in enumerate(train_progress):
-                # 将批次数据移动到设备
-                batch = {k: v.to(device) for k, v in batch.items()}
+                # 动态批次大小调整（GPU预热后使用更大批次）
+                current_batch_size = int(args.batch_size * warmup_factor)
+                if batch['input_ids'].size(0) != current_batch_size:
+                    continue  # 跳过不匹配的批次
 
-                outputs = model(**batch)
-                loss = outputs['loss']
+                try:
+                    # 高效数据转移
+                    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-                # 梯度累积
+                    # 使用自动混合精度（AMP）
+                    if use_amp:
+                        with torch.amp.autocast('cuda'):
+                            outputs = model(**batch)
+                            loss = outputs['loss'] / warmup_factor
+                    else:
+                        outputs = model(**batch)
+                        loss = outputs['loss'] / warmup_factor
+
+                except RuntimeError as e:
+                    if "CUDA" in str(e):
+                        logger.error(f"CUDA错误: {e}")
+                        # 清理GPU缓存并重试
+                        torch.cuda.empty_cache()
+                        continue
+                    else:
+                        raise
+
+                # 梯度累积优化
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
 
-                loss.backward()
-                total_train_loss += loss.item()
+                # 混合精度反向传播
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    if (step + 1) % args.gradient_accumulation_steps == 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        scheduler.step()
+                        optimizer.zero_grad()
+                        # 定期清理GPU缓存
+                        if step % 50 == 0:
+                            torch.cuda.empty_cache()
+                else:
+                    loss.backward()
+                    if (step + 1) % args.gradient_accumulation_steps == 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad()
+                        # 定期清理GPU缓存
+                        if step % 50 == 0:
+                            torch.cuda.empty_cache()
 
-                if (step + 1) % args.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
+                total_train_loss += loss.item() * warmup_factor
 
-                # 更新进度条
-                train_progress.set_postfix({'loss': loss.item()})
+                # 更高效的进度条更新
+                current_loss = loss.item() * warmup_factor
+                current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else args.learning_rate
+                train_progress.set_postfix({
+                    'loss': f"{current_loss:.4f}",
+                    'lr': f"{current_lr:.2e}",
+                    'batch': f"{current_batch_size}"
+                })
 
-                # 记录到WandB
-                if step % 100 == 0:
+                # 减少日志频率以提高性能
+                if step % 50 == 0:  # 每50步记录一次而不是100步
                     wandb.log({
-                        'train_loss': loss.item(),
-                        'learning_rate': scheduler.get_last_lr()[0],
-                        'step': epoch * len(train_dataloader) + step
+                        'train_loss': current_loss,
+                        'learning_rate': current_lr,
+                        'step': epoch * steps_per_epoch + step,
+                        'epoch': epoch + 1,
+                        'gpu_memory_used': torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
                     })
 
             avg_train_loss = total_train_loss / len(train_dataloader)
             logger.info(f"训练损失: {avg_train_loss:.4f}")
 
-            # 验证阶段
+            # 验证阶段 - GPU优化
             model.eval()
             total_val_loss = 0
             all_predictions = {'standard': [], 'level1': [], 'level2': [], 'level3': []}
             all_labels = {'standard': [], 'level1': [], 'level2': [], 'level3': []}
 
             with torch.no_grad():
+                # GPU验证时使用更大的批次
+                val_batch_size = min(args.batch_size * 2, 64)  # 验证时可以使用更大批次
+
                 val_progress = tqdm(val_dataloader, desc=f"验证 Epoch {epoch + 1}")
 
                 for batch in val_progress:
-                    # 将批次数据移动到设备
-                    batch = {k: v.to(device) for k, v in batch.items()}
+                    try:
+                        # 高效数据转移
+                        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-                    outputs = model(**batch)
-                    loss = outputs['loss']
-                    total_val_loss += loss.item()
+                        # 使用混合精度（如果训练时也使用）
+                        if use_amp:
+                            with torch.amp.autocast('cuda'):
+                                outputs = model(**batch)
+                                loss = outputs['loss']
+                        else:
+                            outputs = model(**batch)
+                            loss = outputs['loss']
+
+                        total_val_loss += loss.item()
+
+                    except RuntimeError as e:
+                        if "CUDA" in str(e):
+                            logger.error(f"验证CUDA错误: {e}")
+                            torch.cuda.empty_cache()
+                            continue
+                        else:
+                            raise
 
                     # 收集预测结果 - 兼容性修复
                     for task in ['standard', 'level1', 'level2', 'level3']:
@@ -321,11 +449,19 @@ def run_training():
                 patience_counter = 0
 
                 # 确保models目录存在
-                os.makedirs('../models', exist_ok=True)
+                models_dir = './models'
+                os.makedirs(models_dir, exist_ok=True)
 
                 # 保存模型
-                model.save_pretrained('../models/best_model')
-                tokenizer.save_pretrained('../models/tokenizer')
+                model_path = os.path.join(models_dir, 'best_model')
+                tokenizer_path = os.path.join(models_dir, 'tokenizer')
+                mappings_path = os.path.join(models_dir, 'label_mappings.json')
+
+                logger.info(f"保存模型到: {model_path}")
+                model.save_pretrained(model_path)
+
+                logger.info(f"保存分词器到: {tokenizer_path}")
+                tokenizer.save_pretrained(tokenizer_path)
 
                 # 保存标签映射
                 label_mappings = {
@@ -335,8 +471,10 @@ def run_training():
                     'level3_category': train_dataset.level3_mapping
                 }
 
-                with open('../models/label_mappings.json', 'w', encoding='utf-8') as f:
+                with open(mappings_path, 'w', encoding='utf-8') as f:
                     json.dump(label_mappings, f, ensure_ascii=False, indent=2)
+
+                logger.info(f"保存标签映射到: {mappings_path}")
 
                 logger.info("✅ 保存最佳模型")
             else:
@@ -391,10 +529,11 @@ def main():
     if success:
         print("\n训练完成!")
         print("输出文件:")
-        print("  - models/best_model/: 最佳模型文件")
-        print("  - models/tokenizer/: 分词器文件")
-        print("  - models/label_mappings.json: 标签映射文件")
-        print("  - logs/training.log: 训练日志")
+        print("  - ./models/best_model/: 最佳模型文件")
+        print("  - ./models/tokenizer/: 分词器文件")
+        print("  - ./models/label_mappings.json: 标签映射文件")
+        print("  - ./models/config.json: 模型配置文件")
+        print("  - ./models/pytorch_model.bin: 模型权重文件")
         print("\n下一步:")
         print("  1. 下载 models/ 目录到本地")
         print("  2. 运行 python run_inference.py 测试推理")

@@ -89,6 +89,126 @@ class MultiTaskProductClassifier(BertPreTrainedModel):
 
         return model
 
+    @classmethod
+    def from_saved_model(cls, model_path, **kwargs):
+        """
+        从保存的模型目录加载模型实例
+        支持从本地目录加载训练好的模型
+        """
+        import os
+        import json
+        import torch
+
+        # 检查是否是本地路径
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"模型路径不存在: {model_path}")
+
+        config_path = os.path.join(model_path, "config.json")
+        model_path_file = os.path.join(model_path, "pytorch_model.bin")
+
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"配置文件不存在: {config_path}")
+        if not os.path.exists(model_path_file):
+            raise FileNotFoundError(f"模型权重文件不存在: {model_path_file}")
+
+        # 加载配置
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config_dict = json.load(f)
+
+        # 从参数中覆盖配置（如果有）
+        config_dict.update(kwargs)
+
+        # 创建BERT配置
+        from transformers import BertConfig
+        bert_config = BertConfig(
+            vocab_size=config_dict.get('vocab_size', 21128),
+            hidden_size=config_dict.get('hidden_size', 768),
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            intermediate_size=3072,
+            hidden_act='gelu',
+            hidden_dropout_prob=config_dict.get('hidden_dropout_prob', 0.1),
+            attention_probs_dropout_prob=config_dict.get('attention_probs_dropout_prob', 0.1),
+            max_position_embeddings=config_dict.get('max_position_embeddings', 512),
+            type_vocab_size=2,
+            initializer_range=0.02,
+            layer_norm_eps=1e-12,
+            pad_token_id=0,
+        )
+
+        # 创建模型配置
+        config = cls.config_class.from_dict(config_dict)
+        config.num_labels_standard = config_dict.get('num_labels_standard', 936)
+        config.num_labels_level1 = config_dict.get('num_labels_level1', 24)
+        config.num_labels_level2 = config_dict.get('num_labels_level2', 78)
+        config.num_labels_level3 = config_dict.get('num_labels_level3', 138)
+        config.loss_weights = config_dict.get('loss_weights', {'standard': 0.4, 'level1': 0.2, 'level2': 0.2, 'level3': 0.2})
+
+        # 创建模型实例
+        model = cls(config)
+
+        # 初始化BERT（如果是预训练路径）
+        base_model_name = config_dict.get('base_model', 'dienstag/chinese-bert-wwm-ext')
+        try:
+            model._init_bert_weights(base_model_name)
+        except Exception as e:
+            logger.warning(f"无法加载基础模型权重: {e}")
+            # 使用随机初始化的BERT
+            from transformers import BertModel
+            model.bert = BertModel(bert_config)
+            model._init_classifiers()
+
+        # 加载训练好的权重
+        try:
+            state_dict = torch.load(model_path_file, map_location='cpu')
+
+            # 从实际权重中推断类别数量
+            actual_num_labels_standard = state_dict['classifier_standard']['weight'].shape[0]
+            actual_num_labels_level1 = state_dict['classifier_level1']['weight'].shape[0]
+            actual_num_labels_level2 = state_dict['classifier_level2']['weight'].shape[0]
+            actual_num_labels_level3 = state_dict['classifier_level3']['weight'].shape[0]
+
+            logger.info(f"检测到实际类别数量: standard={actual_num_labels_standard}, level1={actual_num_labels_level1}, level2={actual_num_labels_level2}, level3={actual_num_labels_level3}")
+
+            # 更新配置
+            config.num_labels_standard = actual_num_labels_standard
+            config.num_labels_level1 = actual_num_labels_level1
+            config.num_labels_level2 = actual_num_labels_level2
+            config.num_labels_level3 = actual_num_labels_level3
+
+            # 更新模型属性
+            model.num_labels_standard = actual_num_labels_standard
+            model.num_labels_level1 = actual_num_labels_level1
+            model.num_labels_level2 = actual_num_labels_level2
+            model.num_labels_level3 = actual_num_labels_level3
+
+            # 重新初始化分类器以使用正确的类别数量
+            model._init_classifiers()
+
+            logger.info(f"重新初始化后的分类器尺寸: standard={model.classifier_standard.weight.shape[0]}, level1={model.classifier_level1.weight.shape[0]}")
+
+            # 加载分类器权重
+            model.classifier_standard.load_state_dict(state_dict['classifier_standard'])
+            model.classifier_level1.load_state_dict(state_dict['classifier_level1'])
+            model.classifier_level2.load_state_dict(state_dict['classifier_level2'])
+            model.classifier_level3.load_state_dict(state_dict['classifier_level3'])
+
+            # 如果有BERT权重也加载
+            if 'bert_state_dict' in state_dict:
+                try:
+                    model.bert.load_state_dict(state_dict['bert_state_dict'], strict=False)
+                    logger.info("BERT权重加载成功")
+                except Exception as e:
+                    logger.warning(f"BERT权重加载失败，使用预训练权重: {e}")
+
+            logger.info(f"模型加载成功: {model_path}")
+
+        except Exception as e:
+            logger.error(f"模型权重加载失败: {e}")
+            raise
+
+        return model
+
     def _init_bert_weights(self, model_name_or_path):
         """
         初始化BERT权重
@@ -300,16 +420,92 @@ class MultiTaskProductClassifier(BertPreTrainedModel):
             level2_pred = torch.argmax(probs_level2, dim=-1)
             level3_pred = torch.argmax(probs_level3, dim=-1)
 
+            # 获取每个预测的最大概率作为置信度
+            confidence_standard = probs_standard.max(dim=-1)[0].item()
+            confidence_level1 = probs_level1.max(dim=-1)[0].item()
+            confidence_level2 = probs_level2.max(dim=-1)[0].item()
+            confidence_level3 = probs_level3.max(dim=-1)[0].item()
+
             return {
-                'standard_pred': standard_pred.item(),
-                'level1_pred': level1_pred.item(),
-                'level2_pred': level2_pred.item(),
-                'level3_pred': level3_pred.item(),
-                'confidence_standard': probs_standard[torch.arange(len(probs_standard))].item(),
-                'confidence_level1': probs_level1[torch.arange(len(probs_level1))].item(),
-                'confidence_level2': probs_level2[torch.arange(len(probs_level1))].item(),
-                'confidence_level3': probs_level3[torch.arange(len(probs_level1))].item()
+                'standard': (standard_pred.item(), confidence_standard),
+                'level1': (level1_pred.item(), confidence_level1),
+                'level2': (level2_pred.item(), confidence_level2),
+                'level3': (level3_pred.item(), confidence_level3),
+                'probs': {
+                    'standard': probs_standard,
+                    'level1': probs_level1,
+                    'level2': probs_level2,
+                    'level3': probs_level3
+                }
             }
+
+    def save_pretrained(self, save_directory):
+        """
+        保存模型到指定目录
+        兼容HuggingFace格式，包含完整的模型状态和配置
+        """
+        import os
+        import json
+        import torch
+
+        os.makedirs(save_directory, exist_ok=True)
+        logger.info(f"保存模型到: {save_directory}")
+
+        # 保存整个模型的状态字典（包括BERT和分类器）
+        model_to_save = self.module if hasattr(self, 'module') else self
+        state_dict = {
+            'bert_state_dict': model_to_save.bert.state_dict(),
+            'classifier_standard': model_to_save.classifier_standard.state_dict(),
+            'classifier_level1': model_to_save.classifier_level1.state_dict(),
+            'classifier_level2': model_to_save.classifier_level2.state_dict(),
+            'classifier_level3': model_to_save.classifier_level3.state_dict(),
+        }
+
+        torch.save(state_dict, os.path.join(save_directory, "pytorch_model.bin"))
+
+        # 保存模型配置
+        config_dict = {
+            'num_labels_standard': model_to_save.num_labels_standard,
+            'num_labels_level1': model_to_save.num_labels_level1,
+            'num_labels_level2': model_to_save.num_labels_level2,
+            'num_labels_level3': model_to_save.num_labels_level3,
+            'loss_weights': model_to_save.loss_weights,
+            'model_type': 'multitask_product_classifier',
+            'hidden_size': model_to_save.bert.config.hidden_size,
+            'hidden_dropout_prob': getattr(model_to_save.bert.config, 'hidden_dropout_prob', 0.1),
+            'attention_probs_dropout_prob': getattr(model_to_save.bert.config, 'attention_probs_dropout_prob', 0.1),
+            'classifier_dropout_prob': getattr(model_to_save.bert.config, 'classifier_dropout_prob', None),
+            'vocab_size': model_to_save.bert.config.vocab_size,
+            'max_position_embeddings': model_to_save.bert.config.max_position_embeddings,
+        }
+
+        with open(os.path.join(save_directory, "config.json"), 'w', encoding='utf-8') as f:
+            json.dump(config_dict, f, indent=2, ensure_ascii=False)
+
+        # 保存BERT模型配置和权重
+        try:
+            # 保存BERT配置
+            model_to_save.bert.config.save_pretrained(save_directory)
+            logger.info("BERT配置保存成功")
+        except Exception as e:
+            logger.warning(f"BERT配置保存失败: {e}")
+
+        # 创建模型元数据文件
+        import datetime
+        metadata = {
+            'model_version': '1.0.0',
+            'framework': 'transformers',
+            'task_type': 'multitask-classification',
+            'created_time': datetime.datetime.now().isoformat(),
+            'description': 'Product Multi-Task Classification Model',
+            'tasks': ['standard', 'level1', 'level2', 'level3'],
+            'base_model': 'dienstag/chinese-bert-wwm-ext'
+        }
+
+        with open(os.path.join(save_directory, "metadata.json"), 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"模型保存完成: {save_directory}")
 
 
 # 为了保持向后兼容，创建工厂函数
