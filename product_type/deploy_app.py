@@ -20,13 +20,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
+from src.inference import get_inference_instance
 import uvicorn
 import time
 import json
 from datetime import datetime
 import os
-
-from src.inference import get_inference_instance
 
 # 设置日志
 logging.basicConfig(
@@ -276,9 +275,27 @@ async def get_stats():
 
 
 if __name__ == "__main__":
+    import socket
+
+    # 获取本机IP地址
+    try:
+        # 创建一个socket连接到公共DNS来获取本机IP
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+    except Exception:
+        local_ip = "127.0.0.1"
+
+    print("=" * 60)
+    print("产品分类API服务启动中...")
+    print(f"本地访问: http://localhost:8000")
+    print(f"局域网访问: http://{local_ip}:8000")
+    print(f"API文档: http://{local_ip}:8000/docs")
+    print("=" * 60)
+
     uvicorn.run(
         "deploy_app:app",
-        host="0.0.0.0",
+        host="0.0.0.0",  # 绑定到所有网络接口
         port=8000,
         reload=True,
         log_level="info"
